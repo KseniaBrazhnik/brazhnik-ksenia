@@ -20,8 +20,8 @@ ENV/
 .ipynb_checkpoints/
 
 # Data files (если не хотите коммитить большие файлы)
-# data/train.csv
-# data/test.csv
+data/train.csv
+data/test.csv
 
 # Results (submission создается автоматически)
 results/submission.csv
@@ -32,3 +32,12 @@ results/submission.csv
 # OS
 .DS_Store
 Thumbs.db
+brazhnik-ksenia-solution/
+train/
+test/
+brazhnik-ksenia-solution/
+train/
+test/
+brazhnik-ksenia-solution/
+train/
+test/

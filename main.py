@@ -3,467 +3,369 @@
 Здесь должен быть весь ваш код для создания предсказаний
 """
 
-import numpy as np
+# === 0. Импорты ===
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
+import numpy as np
+import re
+import os
+import torch
+import random
+import tempfile  # ← Добавлено для безопасного создания временной папки
+from sklearn.model_selection import GroupShuffleSplit
+from rank_bm25 import BM25Okapi
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+from lightgbm import LGBMRanker, early_stopping
+from catboost import CatBoostRanker, Pool
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.optim import AdamW
+from tqdm import tqdm
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-class SimpleRLDataContainer:
-    """
-    Класс для загрузки и предобработки данных.
-    Отвечает за чтение CSV файлов, создание признаков и подготовку данных для модели.
-    """
+# Отключаем предупреждения tokenizers о параллелизме при fork
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# === 1. Фиксированный сид ===
+RANDOM_SEED = 993
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# === 2. Вспомогательные функции ===
+STOP_WORDS = set(ENGLISH_STOP_WORDS)
+
+def clean_for_bm25(text):
+    if pd.isna(text) or str(text).lower() in ("none", "nan", ""):
+        return ""
+    text = str(text).lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def clean_for_sbert(text):
+    if pd.isna(text) or str(text).lower() in ("none", "nan", ""):
+        return ""
+    return str(text)
+
+def safe_str(x):
+    if pd.isna(x):
+        return ""
+    return str(x)
+
+def tokenize(text, min_len=2):
+    if not isinstance(text, str) or not text.strip():
+        return []
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [t for t in tokens if t not in STOP_WORDS and len(t) >= min_len]
+
+def make_product_shape(row):
+    title = safe_str(row["product_title"])
+    desc = safe_str(row.get("product_description", ""))
+    bullet = safe_str(row.get("product_bullet_point", ""))
+    return " ".join([title, desc, bullet]).strip()
+
+# === 3. Классы ===
+
+class InMemoryCrossEncoder:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.model.eval()
+        self.device = next(model.parameters()).device
+
+    def predict(self, sentence_pairs, batch_size=32, show_progress_bar=True):
+        scores = []
+        for i in tqdm(range(0, len(sentence_pairs), batch_size), disable=not show_progress_bar, desc="CrossEncoder"):
+            batch = sentence_pairs[i:i+batch_size]
+            enc = self.tokenizer(
+                [p[0] for p in batch],
+                [p[1] for p in batch],
+                truncation=True,
+                padding=True,
+                max_length=512,
+                return_tensors="pt"
+            ).to(self.device)
+            with torch.no_grad():
+                outputs = self.model(**enc)
+                batch_scores = outputs.logits.squeeze().cpu().tolist()
+                if isinstance(batch_scores, list):
+                    scores.extend(batch_scores)
+                else:
+                    scores.append(batch_scores)
+        return np.array(scores)
+
+
+class PairwiseRankingDataset(Dataset):
+    def __init__(self, pairs, tokenizer, max_length=128):
+        self.pairs = pairs
+        self.tokenizer = tokenizer
+        self.max_length = max_length
     
-    def __init__(self, data_path="data"):
-        # Инициализация путей к данным и структуры признаков
-        self.data_path = data_path
-        self.train_path = f"{data_path}/train.csv"
-        self.test_path = f"{data_path}/test.csv"
-        
-        # Данные будут храниться здесь после загрузки
-        self.train_df = None
-        self.test_df = None
-        self.X_train = None
-        self.X_test = None
-        self.actions = None
-        self.rewards = None
-        
-        # Классификация признаков по типам
-        self.numeric_features = ['recency', 'history']  # Числовые признаки
-        self.binary_features = ['mens', 'womens', 'newbie']  # Бинарные признаки (0/1)
-        self.categorical_features = ['zip_code', 'channel']  # Категориальные признаки
-        
-        # Инструменты для предобработки
-        self.scaler = StandardScaler()  # Для нормализации числовых признаков
-        
-        # Сопоставление названий действий с числовыми кодами
-        self.action_mapping = {
-            'Mens E-Mail': 0,
-            'Womens E-Mail': 1, 
-            'No E-Mail': 2
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        query, pos_doc, neg_doc = self.pairs[idx]
+        pos_enc = self.tokenizer(query, pos_doc, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
+        neg_enc = self.tokenizer(query, neg_doc, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
+        return {
+            "input_ids_pos": pos_enc["input_ids"].flatten(),
+            "attention_mask_pos": pos_enc["attention_mask"].flatten(),
+            "input_ids_neg": neg_enc["input_ids"].flatten(),
+            "attention_mask_neg": neg_enc["attention_mask"].flatten(),
         }
-        
-    def load_data(self):
-        """Загрузка тренировочных и тестовых данных из CSV файлов"""
-        self.train_df = pd.read_csv(self.train_path)
-        self.test_df = pd.read_csv(self.test_path)
-        return self
-    
-    def prepare_features(self):
-        """Основной метод подготовки признаков"""
-        # Числовые признаки
-        X_train_numeric = self.train_df[self.numeric_features].copy()
-        X_test_numeric = self.test_df[self.numeric_features].copy()
-        
-        # Бинарные признаки
-        X_train_binary = self.train_df[self.binary_features].copy()
-        X_test_binary = self.test_df[self.binary_features].copy()
-        
-        # CTR encoding для категориальных признаков
-        # Заменяем категории на среднюю вероятность визита для этой категории
-        ctr_maps = {}
-        for col in self.categorical_features:
-            ctr_map = {}
-            for value in self.train_df[col].unique():
-                mask = self.train_df[col] == value
-                ctr = self.train_df.loc[mask, 'visit'].mean()
-                ctr_map[value] = ctr
-            ctr_maps[col] = ctr_map
-        
-        # Применяем CTR encoding к тренировочным данным
-        X_train_ctr = self.train_df[self.categorical_features].copy()
-        for col in self.categorical_features:
-            X_train_ctr[col] = X_train_ctr[col].map(ctr_maps[col])
-        
-        # Применяем CTR encoding к тестовым данным
-        X_test_ctr = self.test_df[self.categorical_features].copy()
-        for col in self.categorical_features:
-            X_test_ctr[col] = X_test_ctr[col].map(ctr_maps[col])
-        
-        # Создаем дополнительные "умные" признаки
-        X_train_smart = self._create_smart_features(self.train_df)
-        X_test_smart = self._create_smart_features(self.test_df)
-        
-        # Объединяем все признаки в финальные матрицы
-        self.X_train = pd.concat([X_train_numeric, X_train_binary, X_train_ctr, X_train_smart], axis=1)
-        self.X_test = pd.concat([X_test_numeric, X_test_binary, X_test_ctr, X_test_smart], axis=1)
-        
-        # Нормализация числовых признаков
-        cols_to_scale = self.X_train.columns
-        self.X_train[cols_to_scale] = self.scaler.fit_transform(self.X_train[cols_to_scale])
-        self.X_test[cols_to_scale] = self.scaler.transform(self.X_test[cols_to_scale])
-        
-        # Подготовка целевых переменных
-        self.actions = self.train_df['segment'].map(self.action_mapping).values
-        self.rewards = self.train_df['visit'].values
-        
-        return self
-    
-    def _create_smart_features(self, df):
-        """Создание дополнительных engineered features"""
-        features = pd.DataFrame(index=df.index)
-        # Взаимодействие признаков
-        features['recency_x_history'] = df['recency'] * df['history']
-        # Логарифмирование для нормализации распределения
-        features['log_history'] = np.log(df['history'] + 1)
-        # Общий уровень интереса к товарам
-        features['total_interest'] = df['mens'] + df['womens']
-        # Доминирующий интерес
-        features['dominant_mens'] = (df['mens'] > df['womens']).astype(int)
-        features['dominant_womens'] = (df['womens'] > df['mens']).astype(int)
-        return features
-    
-    def get_train_data(self):
-        """Возвращает подготовленные тренировочные данные"""
-        return self.X_train.values, self.actions, self.rewards
-    
-    def get_test_data(self):
-        """Возвращает подготовленные тестовые данные"""
-        return self.X_test.values
-    
-    def get_test_ids(self):
-        """Возвращает идентификаторы тестовых клиентов"""
-        return self.test_df['id'].values
 
-class ImprovedSmartHybridEpsilonGreedy:
-    """
-    Гибридная модель, сочетающая Reinforcement Learning (RL) и Machine Learning (ML).
-    RL обеспечивает надежность, ML - точность для конкретных случаев.
-    """
-    
-    def __init__(self, n_arms=3, epsilon=0.05):
-        # Основные параметры
-        self.n_arms = n_arms  # Количество возможных действий
-        self.epsilon = epsilon  # Вероятность исследования (exploration)
-        
-        # ML компонент: отдельная модель для каждого действия
-        self.ml_models = [None, None, None]
-        
-        # RL компонент: статистика по эффективности действий
-        self.arm_rewards = np.zeros(n_arms)  # Средняя награда для каждого действия
-        self.arm_counts = np.zeros(n_arms)   # Количество использований каждого действия
-        self.arm_confidence = np.zeros(n_arms)  # Уверенность в оценке каждого действия
-        self.best_action = 0  # Лучшее действие по RL статистике
-        
-        # Для удобства интерпретации
-        self.action_names = ['Mens Email', 'Womens Email', 'No Email']
-        
-        # Для воспроизводимости результатов
-        np.random.seed(42)
-    
-    def fit(self, X, actions, rewards):
-        """Основной метод обучения модели"""
-        print("ОБУЧЕНИЕ IMPROVED SMART HYBRID MODEL...")
-        print("=" * 50)
-        
-        # 1. Сбор RL статистики (общая эффективность действий)
-        print("СОБИРАЕМ RL СТАТИСТИКУ...")
-        self._collect_robust_rl_statistics(actions, rewards)
-        
-        # 2. Обучение ML моделей (индивидуальные предсказания)
-        print("ОБУЧАЕМ ML МОДЕЛИ...")
-        self._train_improved_ml_models(X, actions, rewards)
-        
-        print("\nОБУЧЕНИЕ ЗАВЕРШЕНО!")
-        return self
-    
-    def _collect_robust_rl_statistics(self, actions, rewards):
-        """Сбор статистики по эффективности каждого действия"""
-        # Обновляем статистику для каждого наблюдения
-        for action, reward in zip(actions, rewards):
-            self.arm_counts[action] += 1
-            # Инкрементальное обновление средней награды
-            self.arm_rewards[action] += (reward - self.arm_rewards[action]) / self.arm_counts[action]
-        
-        # Вычисляем уверенность для каждого действия (чем больше данных, тем выше уверенность)
-        for action in range(3):
-            self.arm_confidence[action] = min(1.0, np.log(self.arm_counts[action] + 1) / 10)
-        
-        # Определяем лучшее действие
-        self.best_action = np.argmax(self.arm_rewards)
-        
-        # Вывод статистики
-        print("   Итоговая статистика:")
-        for action in range(3):
-            confidence = self.arm_confidence[action]
-            print(f"     {self.action_names[action]}: "
-                  f"награда={self.arm_rewards[action]:.3f}, "
-                  f"выборов={self.arm_counts[action]:.0f}, "
-                  f"уверенность={confidence:.3f}")
-        
-        best_reward = self.arm_rewards[self.best_action]
-        print(f"   Лучшее действие: {self.action_names[self.best_action]} "
-              f"(награда: {best_reward:.3f})")
-        
-        # Анализ преимущества лучшего действия над вторым
-        rewards_sorted = sorted(self.arm_rewards, reverse=True)
-        advantage = rewards_sorted[0] - rewards_sorted[1] if len(rewards_sorted) > 1 else 0
-        print(f"   Преимущество над вторым: {advantage:.3f}")
-    
-    def _train_improved_ml_models(self, X, actions, rewards):
-        """Обучение ML моделей для каждого действия"""
-        for action in range(3):
-            # Выбираем данные только для текущего действия
-            action_mask = (actions == action)
-            X_action = X[action_mask]
-            y_action = rewards[action_mask]
-            
-            print(f"   Действие {action} ({self.action_names[action]}):")
-            print(f"     Примеров: {len(X_action)}, Успехов: {np.sum(y_action)}")
-            
-            # Обучаем модель только если достаточно данных
-            if len(X_action) > 50 and len(np.unique(y_action)) > 1:
-                model = RandomForestClassifier(
-                    n_estimators=100,
-                    max_depth=15,
-                    min_samples_split=25,
-                    min_samples_leaf=10,
-                    random_state=42,
-                    n_jobs=-1
-                )
-                model.fit(X_action, y_action)
-                self.ml_models[action] = model
-                
-                # Оценка качества модели
-                train_score = model.score(X_action, y_action)
-                print(f" Обучена! Accuracy: {train_score:.3f}")
-    
-    def predict_proba(self, X):
-        """Основной метод предсказания вероятностей действий"""
-        n_samples = X.shape[0]
-        probabilities = np.zeros((n_samples, self.n_arms))
-        
-        print(f"ПРЕДСКАЗЫВАЕМ ДЛЯ {n_samples} КЛИЕНТОВ...")
-        print("   Стратегия: RL основной + ML коррекция + МИНИМАЛЬНОЕ исследование")
-        
-        # Для каждого клиента принимаем решение
-        for i in range(n_samples):
-            x = X[i]
-            
-            # Получаем предсказания от ML моделей
-            ml_predictions = self._get_ml_predictions(x)
-            
-            # Начинаем с RL лучшего действия
-            base_probs = np.zeros(self.n_arms)
-            base_probs[self.best_action] = 1.0
-            
-            # Принимаем финальное решение
-            final_probs = self._rl_prioritized_decision(base_probs, ml_predictions, i)
-            
-            probabilities[i] = final_probs
-        
-        return probabilities
-    
-    def _get_ml_predictions(self, x):
-        """Получение предсказаний от всех ML моделей"""
-        predictions = []
-        for action in range(3):
-            if self.ml_models[action] is not None:
-                # Предсказываем вероятность визита для данного действия
-                prob = self.ml_models[action].predict_proba([x])[0][1]
-                predictions.append(prob)
-            else:
-                predictions.append(0.0)
-        return np.array(predictions)
-    
-    def _rl_prioritized_decision(self, base_probs, ml_predictions, client_idx):
-        """Принятие решения с приоритетом RL"""
-        
-        # С вероятностью epsilon идем на исследование
-        if np.random.random() < self.epsilon:
-            return self._conservative_exploration(ml_predictions)
-        else:
-            # В остальных случаях используем знания
-            return self._conservative_exploitation(base_probs, ml_predictions, client_idx)
-    
-    def _conservative_exploration(self, ml_predictions):
-        """Консервативная стратегия исследования"""
-        # Следуем ML предсказаниям, но с осторожностью
-        if np.sum(ml_predictions) > 0:
-            ml_probs = ml_predictions / np.sum(ml_predictions)
-        else:
-            ml_probs = np.ones(self.n_arms) / self.n_arms
-        
-        # Смешиваем с равномерным распределением для безопасности
-        uniform_probs = np.ones(self.n_arms) / self.n_arms
-        final_probs = 0.7 * ml_probs + 0.3 * uniform_probs
-        
-        # Гарантируем корректность вероятностей
-        final_probs = np.maximum(final_probs, 0.01)
-        final_probs = final_probs / np.sum(final_probs)
-        
-        return final_probs
-    
-    def _conservative_exploitation(self, base_probs, ml_predictions, client_idx):
-        """Консервативное использование знаний с ML коррекцией"""
-        # Начинаем с RL лучшего действия
-        final_probs = base_probs.copy()
-        
-        # Проверяем условия для ML коррекции
-        ml_best_action = np.argmax(ml_predictions)
-        
-        if (ml_best_action != self.best_action and 
-            self.ml_models[ml_best_action] is not None):
-            
-            # Вычисляем преимущество ML над RL
-            ml_advantage = ml_predictions[ml_best_action] - ml_predictions[self.best_action]
-            
-            # Строгие условия для переключения на ML
-            if ml_advantage > 0.15:
-                # Случайное решение для разнообразия
-                if np.random.random() < 0.2:
-                    final_probs = np.zeros(self.n_arms)
-                    final_probs[ml_best_action] = 1.0
-                    
-                    # Логируем только первые несколько решений
-                    if client_idx < 2:
-                        print(f"     Клиент {client_idx + 1}: "
-                              f"ML переопределил RL (advantage: {ml_advantage:.3f})")
-        
-        return final_probs
-
-class SNIPSEvaluator:
-    """
-    Класс для оценки качества политики с помощью SNIPS метрики.
-    SNIPS (Self-Normalized Inverse Propensity Scoring) корректирует смещение
-    в данных, вызванное тем, что исторические данные собирались другой политикой.
-    """
-    
-    def __init__(self, logging_policy_proba=1/3):
-        # Вероятность выбора действия исторической политикой
-        self.logging_policy_proba = logging_policy_proba
-    
-    def evaluate_policy(self, actions, rewards, policy_probas):
-        """Оценка политики с помощью SNIPS метрики"""
-        
-        weights = []
-        for i, action in enumerate(actions):
-            # Вероятность выбора этого действия нашей политикой
-            pi_a_given_x = policy_probas[i, action]
-            # Вес = наша политика / историческая политика
-            weight = pi_a_given_x / self.logging_policy_proba
-            weights.append(weight)
-        
-        weights = np.array(weights)
-        
-        # SNIPS оценка (взвешенное среднее)
-        numerator = np.sum(weights * rewards)
-        denominator = np.sum(weights)
-        snips_value = numerator / denominator if denominator != 0 else 0
-        
-        # Лучшая статическая политика (всегда одно действие)
-        static_values = []
-        for action in [0, 1, 2]:
-            mask = (actions == action)
-            if np.sum(mask) > 0:
-                static_value = np.mean(rewards[mask])
-                static_values.append(static_value)
-        
-        best_static = max(static_values) if static_values else 0
-        
-        # Финальный скор: насколько наша политика лучше лучшей статической
-        score = snips_value - best_static
-        
-        return score, snips_value, best_static
-
-
+# === 4. Функция сохранения submission ===
 def create_submission(predictions):
-    """
-    Пропишите здесь создание файла submission.csv в папку results
-    !!! ВНИМАНИЕ !!! ФАЙЛ должен иметь именно такого названия
-    """
-
-    # Создать пандас таблицу submission
-    submission = predictions
-
-    import os
-    import pandas as pd
+    submission = pd.DataFrame({
+        "id": test_df["id"],
+        "prediction": predictions
+    })
     os.makedirs('results', exist_ok=True)
     submission_path = 'results/submission.csv'
     submission.to_csv(submission_path, index=False)
-    
     print(f"Submission файл сохранен: {submission_path}")
-    
     return submission_path
 
-
+# === 5. Основная функция ===
 def main():
-    """
-    Главная функция программы
-    
-    Вы можете изменять эту функцию под свои нужды,
-    но обязательно вызовите create_submission() в конце!
-    """
     print("=" * 50)
     print("Запуск решения соревнования")
     print("=" * 50)
     
-    # Загрузка и подготовка данных
-    print("загрузка данных...")
-    data_container = SimpleRLDataContainer()
-    data_container.load_data()
-    data_container.prepare_features()
+    global test_df
+
+    # === Загрузка данных ===
+    print("Загружаем данные...")
+    df_train = pd.read_csv("data/train.csv")
+    test_df = pd.read_csv("data/test.csv")
     
-    X_train, actions, rewards = data_container.get_train_data()
-    X_test = data_container.get_test_data()
-    test_ids = data_container.get_test_ids()
+    df_train["product_brand"] = df_train["product_brand"].fillna("unknown_brand")
+    df_train["product_color"] = df_train["product_color"].fillna("unknown_color")
+    test_df["product_brand"] = test_df["product_brand"].fillna("unknown_brand")
+    test_df["product_color"] = test_df["product_color"].fillna("unknown_color")
     
-    print(f"   Тренировочные данные: {X_train.shape}")
-    print(f"   Тестовые данные: {X_test.shape}")
-    print(f"   Всего наград (visit=1): {np.sum(rewards)}/{len(rewards)}")
+    df_train["product_text"] = df_train.apply(make_product_shape, axis=1)
+    test_df["product_text"] = test_df.apply(make_product_shape, axis=1)
     
-    # Обучение модели
-    print("\nОБУЧЕНИЕ УЛУЧШЕННОЙ МОДЕЛИ...")
-    model = ImprovedSmartHybridEpsilonGreedy(n_arms=3, epsilon=0.05)
-    model.fit(X_train, actions, rewards)
+    # === Создание ranking-пар ===
+    print("Создаём ranking-пары...")
+    pairs = []
+    for qid, group in df_train.groupby("query_id"):
+        if len(group) < 2:
+            continue
+        group = group.sort_values("relevance", ascending=False).reset_index(drop=True)
+        rels = group["relevance"].values
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                if rels[i] > rels[j]:
+                    pairs.append((
+                        group["query"].iloc[i],
+                        group["product_text"].iloc[i],
+                        group["product_text"].iloc[j]
+                    ))
+    print(f"Создано {len(pairs)} пар")
     
-    # Оценка качества на части тренировочных данных
-    print("\nОЦЕНКА КАЧЕСТВА...")
-    evaluator = SNIPSEvaluator()
-    train_probas = model.predict_proba(X_train[:1000])
-    score, snips, best_static = evaluator.evaluate_policy(
-        actions[:1000], rewards[:1000], train_probas
+    # === Дообучение cross-encoder ===
+    print("Дообучаем cross-encoder...")
+    MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=1)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    
+    dataset = PairwiseRankingDataset(pairs, tokenizer, max_length=128)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+    
+    optimizer = AdamW(model.parameters(), lr=1e-5)
+    margin = 1.0
+    model.train()
+    
+    for batch in dataloader:
+        optimizer.zero_grad()
+        input_ids_pos = batch["input_ids_pos"].to(device)
+        attention_mask_pos = batch["attention_mask_pos"].to(device)
+        input_ids_neg = batch["input_ids_neg"].to(device)
+        attention_mask_neg = batch["attention_mask_neg"].to(device)
+    
+        pos_scores = model(input_ids_pos, attention_mask=attention_mask_pos).logits.squeeze()
+        neg_scores = model(input_ids_neg, attention_mask=attention_mask_neg).logits.squeeze()
+        loss = torch.mean(torch.clamp(margin - (pos_scores - neg_scores), min=0))
+        loss.backward()
+        optimizer.step()
+    
+    print("✅ Дообучение завершено")
+    
+    # === Инициализация моделей для инференса ===
+    cross_encoder = InMemoryCrossEncoder(model, tokenizer)
+    sbert_model = SentenceTransformer('sentence-transformers/msmarco-MiniLM-L-12-v3')
+    
+    # === Подготовка глобальных эмбеддингов и BM25 ===
+    unique_queries = pd.concat([df_train["query"], test_df["query"]]).drop_duplicates().apply(clean_for_sbert).tolist()
+    unique_products = pd.concat([df_train["product_text"], test_df["product_text"]]).drop_duplicates().tolist()
+    all_texts = list(set(unique_queries + unique_products))
+    embeddings = sbert_model.encode(all_texts, batch_size=256, convert_to_numpy=True, device=device)
+    text_to_emb = dict(zip(all_texts, embeddings))
+    
+    def build_global_bm25(df):
+        doc_ids = []
+        texts = []
+        for _, row in df.iterrows():
+            full = row["product_text"]
+            doc_ids.append(row["product_id"])
+            texts.append(full)
+        tokenized = [tokenize(clean_for_bm25(t)) for t in texts]
+        bm25 = BM25Okapi(tokenized)
+        return bm25, doc_ids
+    
+    global_bm25, global_doc_ids = build_global_bm25(df_train)
+    global_doc_id_to_idx = {pid: i for i, pid in enumerate(global_doc_ids)}
+    
+    # === Разбиение на train/val ===
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_SEED)
+    train_idx, val_idx = next(gss.split(df_train, groups=df_train["query_id"]))
+    df_train_split = df_train.iloc[train_idx].reset_index(drop=True)
+    df_val_split = df_train.iloc[val_idx].reset_index(drop=True)
+    
+    # === Функция извлечения признаков ===
+    def extract_features_with_cross_encoder(df):
+        feature_rows = []
+        pairs = []
+        for qid, group in df.groupby("query_id"):
+            query_raw = group["query"].iloc[0]
+            for _, row in group.iterrows():
+                pairs.append((query_raw, row["product_text"]))
+        cross_scores = cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False)
+        pair_idx = 0
+        for qid, group in df.groupby("query_id"):
+            query_raw = group["query"].iloc[0]
+            query_sbert = clean_for_sbert(query_raw)
+            query_bm25 = clean_for_bm25(query_raw)
+            q_tokens = tokenize(query_bm25)
+            docs_sbert = []
+            docs_bm25 = []
+            product_ids = []
+            doc_embs = []
+            cross_vals = []
+            for _, row in group.iterrows():
+                full_sbert = row["product_text"]
+                full_bm25 = clean_for_bm25(full_sbert)
+                docs_sbert.append(full_sbert)
+                docs_bm25.append(full_bm25)
+                product_ids.append(row["product_id"])
+                doc_embs.append(text_to_emb[full_sbert])
+                cross_vals.append(cross_scores[pair_idx])
+                pair_idx += 1
+            query_emb = text_to_emb[query_sbert]
+            sbert_sims = cosine_similarity([query_emb], doc_embs).ravel()
+            tokenized_local = [tokenize(d) for d in docs_bm25]
+            bm25_local_scores = BM25Okapi(tokenized_local).get_scores(q_tokens) if any(tokenized_local) else np.zeros(len(docs_bm25))
+            tfidf_sims = np.zeros(len(docs_bm25))
+            if any(docs_bm25):
+                try:
+                    tfidf = TfidfVectorizer(stop_words="english", ngram_range=(1,2), min_df=1, max_features=10000)
+                    X_docs = tfidf.fit_transform(docs_bm25)
+                    X_q = tfidf.transform([query_bm25])
+                    tfidf_sims = cosine_similarity(X_docs, X_q).ravel()
+                except:
+                    pass
+            global_scores = []
+            for pid in product_ids:
+                idx = global_doc_id_to_idx.get(pid, -1)
+                score = global_bm25.get_scores(q_tokens)[idx] if idx != -1 else 0.0
+                global_scores.append(float(score))
+            for i, (_, row) in enumerate(group.iterrows()):
+                d_tokens = tokenize(docs_bm25[i])
+                overlap = len(set(q_tokens) & set(d_tokens)) / max(1, len(set(q_tokens)))
+                brand_match = 1 if row["product_brand"].lower() in q_tokens else 0
+                color_match = 1 if row["product_color"].lower() in q_tokens else 0
+                qlen = len(q_tokens)
+                tlen = len(tokenize(row["product_title"]))
+                dlen = len(tokenize(row.get("product_description", "")))
+                blen = len(tokenize(row.get("product_bullet_point", "")))
+                has_desc = 1 if pd.notna(row.get("product_description")) and safe_str(row["product_description"]).strip() else 0
+                has_bullet = 1 if pd.notna(row.get("product_bullet_point")) and safe_str(row["product_bullet_point"]).strip() else 0
+                feat = {
+                    "bm25_local": float(bm25_local_scores[i]),
+                    "bm25_global": float(global_scores[i]),
+                    "tfidf_cosine": float(tfidf_sims[i]),
+                    "cross_encoder_score": float(cross_vals[i]),
+                    "overlap_token_ratio": float(overlap),
+                    "brand_in_query": int(brand_match),
+                    "color_in_query": int(color_match),
+                    "query_len_tokens": int(qlen),
+                    "title_len_tokens": int(tlen),
+                    "desc_len_tokens": int(dlen),
+                    "bullet_len_tokens": int(blen),
+                    "text_total_tokens": int(tlen + dlen + blen),
+                    "has_desc": int(has_desc),
+                    "has_bullet": int(has_bullet)
+                }
+                feature_rows.append(feat)
+        return pd.DataFrame(feature_rows)
+    
+    # === Извлечение признаков ===
+    print("Извлекаем признаки...")
+    X_train = extract_features_with_cross_encoder(df_train_split)
+    X_val = extract_features_with_cross_encoder(df_val_split)
+    X_test = extract_features_with_cross_encoder(test_df)
+    
+    y_train = df_train_split["relevance"].values.astype(np.float32)
+    y_val = df_val_split["relevance"].values.astype(np.float32)
+    train_groups = df_train_split.groupby("query_id").size().values
+    val_groups = df_val_split.groupby("query_id").size().values
+    
+    # === LightGBM ===
+    lgb_ranker = LGBMRanker(
+        objective="lambdarank",
+        metric="ndcg",
+        ndcg_eval_at=[10],
+        n_estimators=300,
+        num_leaves=31,
+        learning_rate=0.1,
+        min_data_in_leaf=15,
+        feature_fraction=0.85,
+        random_state=RANDOM_SEED,
+        verbose=0
+    )
+    lgb_ranker.fit(
+        X_train, y_train,
+        group=train_groups,
+        eval_set=[(X_val, y_val)],
+        eval_group=[val_groups],
+        callbacks=[early_stopping(stopping_rounds=30, verbose=False)]
     )
     
-    print(f"   SNIPS Value: {snips:.4f}")
-    print(f"   Best Static Policy: {best_static:.4f}")
-    print(f"   FINAL SCORE: {score:.4f}")
-    
-    # Предсказание на тестовых данных
-    print("\nПРЕДСКАЗАНИЕ НА ТЕСТЕ...")
-    probabilities = model.predict_proba(X_test)
-    
-    # Создание submission DataFrame
-    submission = pd.DataFrame({
-        'id': test_ids,
-        'p_mens_email': probabilities[:, 0],
-        'p_womens_email': probabilities[:, 1], 
-        'p_no_email': probabilities[:, 2]
-    })
-    
-    # Нормализация вероятностей (сумма = 1)
-    sums = submission[['p_mens_email', 'p_womens_email', 'p_no_email']].sum(axis=1)
-    submission[['p_mens_email', 'p_womens_email', 'p_no_email']] = (
-        submission[['p_mens_email', 'p_womens_email', 'p_no_email']].div(sums, axis=0)
+    # === CatBoost (исправлено: временная директория) ===
+    catboost_train_dir = tempfile.mkdtemp(prefix="catboost_")
+    print(f"CatBoost использует временную директорию: {catboost_train_dir}")
+
+    train_pool = Pool(X_train, y_train, group_id=df_train_split["query_id"].values)
+    val_pool = Pool(X_val, y_val, group_id=df_val_split["query_id"].values)
+    cb_ranker = CatBoostRanker(
+        loss_function="YetiRank",
+        iterations=500,
+        learning_rate=0.05,
+        depth=8,
+        l2_leaf_reg=3,
+        random_seed=RANDOM_SEED,
+        verbose=0,
+        use_best_model=True,
+        early_stopping_rounds=30,
+        train_dir=catboost_train_dir  # ← безопасный путь
     )
+    cb_ranker.fit(train_pool, eval_set=val_pool)
     
-    # Статистика submission
-    print("\nСТАТИСТИКА SUBMISSION:")
-    for col in ['p_mens_email', 'p_womens_email', 'p_no_email']:
-        mean_val = submission[col].mean()
-        std_val = submission[col].std()
-        print(f"   {col}: mean={mean_val:.3f}, std={std_val:.3f}")
+    # === Ансамбль и submission ===
+    print("Делаем предсказания на тесте...")
+    pred_lgb_test = lgb_ranker.predict(X_test)
+    pred_cb_test = cb_ranker.predict(X_test)
+    final_pred = 0.91 * pred_cb_test + 0.09 * pred_lgb_test
     
-    # Анализ распределения рекомендаций
-    best_actions = np.argmax(probabilities, axis=1)
-    for action in range(3):
-        action_count = np.sum(best_actions == action)
-        print(f"   {model.action_names[action]}: {action_count/len(best_actions):.1%}")
-    
-    # Создание submission файла (ОБЯЗАТЕЛЬНО!)
-    create_submission(submission)
+    create_submission(final_pred)
     
     print("=" * 50)
     print("Выполнение завершено успешно!")
